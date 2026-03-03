@@ -380,7 +380,7 @@ async function doctor(): Promise<number> {
     p.log.warn(
       color.yellow("npm (MCP): WARN") +
         ` — local v${localVersion}, latest v${latestVersion}` +
-        color.dim("\n  Run: npm install -g context-mode@latest"),
+        color.dim("\n  Run: /context-mode:upgrade"),
     );
   }
 
@@ -399,7 +399,7 @@ async function doctor(): Promise<number> {
     p.log.warn(
       color.yellow("Marketplace: WARN") +
         ` — v${marketplaceVersion}, latest v${latestVersion}` +
-        color.dim("\n  Update via Claude Code marketplace or reinstall plugin"),
+        color.dim("\n  Run: /context-mode:upgrade"),
     );
   } else {
     p.log.info(
