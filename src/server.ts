@@ -3,10 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, unlinkSync, readdirSync } from "node:fs";
+import { existsSync, unlinkSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { ContentStore, cleanupStaleDBs, type SearchResult, type IndexResult } from "./store.js";
@@ -397,11 +397,23 @@ if(__cm_net>0)process.stderr.write('__CM_NET__:'+__cm_net+'\\n');
       }
 
       if (result.timedOut) {
+        const partialOutput = result.stdout?.trim();
+        if (partialOutput) {
+          // Timeout with partial output — return as success with note
+          return trackResponse("ctx_execute", {
+            content: [
+              {
+                type: "text" as const,
+                text: `${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
+              },
+            ],
+          });
+        }
         return trackResponse("ctx_execute", {
           content: [
             {
               type: "text" as const,
-              text: `Execution timed out after ${timeout}ms\n\nPartial stdout:\n${result.stdout}\n\nstderr:\n${result.stderr}`,
+              text: `Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
             },
           ],
           isError: true,
@@ -929,13 +941,23 @@ function resolveGfmPluginPath(): string {
 // Subprocess code that fetches a URL, detects Content-Type, and outputs a
 // __CM_CT__:<type> marker on the first line so the handler can route to the
 // appropriate indexing strategy.  HTML is converted to markdown via Turndown.
-function buildFetchCode(url: string): string {
+function buildFetchCode(url: string, outputPath: string): string {
   const turndownPath = JSON.stringify(resolveTurndownPath());
   const gfmPath = JSON.stringify(resolveGfmPluginPath());
+  const escapedOutputPath = JSON.stringify(outputPath);
   return `
 const TurndownService = require(${turndownPath});
 const { gfm } = require(${gfmPath});
+const fs = require('fs');
 const url = ${JSON.stringify(url)};
+const outputPath = ${escapedOutputPath};
+
+function emit(ct, content) {
+  // Write content to file to bypass executor stdout truncation (100KB limit).
+  // Only the content-type marker goes to stdout.
+  fs.writeFileSync(outputPath, content);
+  console.log('__CM_CT__:' + ct);
+}
 
 async function main() {
   const resp = await fetch(url);
@@ -947,12 +969,9 @@ async function main() {
     const text = await resp.text();
     try {
       const pretty = JSON.stringify(JSON.parse(text), null, 2);
-      console.log('__CM_CT__:json');
-      console.log(pretty);
+      emit('json', pretty);
     } catch {
-      // Unparseable "JSON" — fall back to plain text
-      console.log('__CM_CT__:text');
-      console.log(text);
+      emit('text', text);
     }
     return;
   }
@@ -963,15 +982,13 @@ async function main() {
     const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
     td.use(gfm);
     td.remove(['script', 'style', 'nav', 'header', 'footer', 'noscript']);
-    console.log('__CM_CT__:html');
-    console.log(td.turndown(html));
+    emit('html', td.turndown(html));
     return;
   }
 
   // --- Everything else: plain text, CSV, XML, etc. ---
   const text = await resp.text();
-  console.log('__CM_CT__:text');
-  console.log(text);
+  emit('text', text);
 }
 main();
 `;
@@ -997,9 +1014,12 @@ server.registerTool(
     }),
   },
   async ({ url, source }) => {
+    // Generate a unique temp file path for the subprocess to write fetched content.
+    // This bypasses the executor's 100KB stdout truncation — content goes file→handler directly.
+    const outputPath = join(tmpdir(), `ctx-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
+
     try {
-      // Execute fetch inside subprocess — raw HTML never enters context
-      const fetchCode = buildFetchCode(url);
+      const fetchCode = buildFetchCode(url, outputPath);
       const result = await executor.execute({
         language: "javascript",
         code: fetchCode,
@@ -1018,13 +1038,25 @@ server.registerTool(
         });
       }
 
-      // Parse content-type marker from subprocess output
+      // Parse content-type marker from stdout (content is in the temp file)
       const store = getStore();
-      const rawOutput = (result.stdout || "").trim();
-      const firstNewline = rawOutput.indexOf("\n");
-      const header = firstNewline >= 0 ? rawOutput.slice(0, firstNewline) : "";
-      const content = firstNewline >= 0 ? rawOutput.slice(firstNewline + 1) : rawOutput;
-      const markdown = content.trim();
+      const header = (result.stdout || "").trim();
+
+      // Read full content from temp file (bypasses smartTruncate)
+      let markdown: string;
+      try {
+        markdown = readFileSync(outputPath, "utf-8").trim();
+      } catch {
+        return trackResponse("ctx_fetch_and_index", {
+          content: [
+            {
+              type: "text" as const,
+              text: `Fetched ${url} but could not read subprocess output`,
+            },
+          ],
+          isError: true,
+        });
+      }
 
       if (markdown.length === 0) {
         return trackResponse("ctx_fetch_and_index", {
@@ -1078,6 +1110,9 @@ server.registerTool(
         ],
         isError: true,
       });
+    } finally {
+      // Clean up temp file
+      try { rmSync(outputPath); } catch { /* already gone */ }
     }
   },
 );
