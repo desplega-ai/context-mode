@@ -239,3 +239,98 @@ describe("resume injection (before_prompt_build)", () => {
     assert.equal(result, undefined, "must return undefined if compact_count is 0");
   });
 });
+
+// ════════════════════════════════════════════
+// before_model_resolve — user message capture
+// ════════════════════════════════════════════
+
+describe("before_model_resolve hook", () => {
+  beforeEach(() => { vi.resetModules(); });
+
+  test("before_model_resolve hook is registered", async () => {
+    const { default: plugin } = await import("../src/openclaw-plugin.js");
+    const { api, typedHooks } = createMockApi();
+
+    plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+    const hook = typedHooks.find(h => h.hookName === "before_model_resolve");
+    assert.ok(hook, "before_model_resolve hook must be registered");
+  });
+
+  test("before_model_resolve captures decision events — extractUserEvents integration", async () => {
+    // Verify extractUserEvents correctly identifies decision messages
+    // (the hook pipes userMessage through this function)
+    const { extractUserEvents } = await import("../src/session/extract.js");
+    const events = extractUserEvents("don't use that approach, use X instead");
+    const decisionEvents = events.filter(e => e.category === "decision");
+    assert.ok(decisionEvents.length > 0, "extractUserEvents must return decision events");
+  });
+
+  test("before_model_resolve handler runs without throwing on decision message", async () => {
+    const { default: plugin } = await import("../src/openclaw-plugin.js");
+    const { api, typedHooks } = createMockApi();
+
+    plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+    const hook = typedHooks.find(h => h.hookName === "before_model_resolve");
+    assert.ok(hook, "before_model_resolve must be registered");
+
+    // Must not throw on a decision-style message
+    await assert.doesNotReject(
+      () => Promise.resolve(hook.handler({ userMessage: "don't use that approach, use X instead" })),
+    );
+  });
+
+  test("before_model_resolve is silent when userMessage is empty", async () => {
+    const { default: plugin } = await import("../src/openclaw-plugin.js");
+    const { api, typedHooks } = createMockApi();
+
+    plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+    const hook = typedHooks.find(h => h.hookName === "before_model_resolve");
+    assert.ok(hook);
+
+    // Must not throw on empty or missing message
+    await assert.doesNotReject(() => Promise.resolve(hook.handler({})));
+    await assert.doesNotReject(() => Promise.resolve(hook.handler({ userMessage: "" })));
+  });
+});
+
+// ════════════════════════════════════════════
+// command:reset and command:stop hooks
+// ════════════════════════════════════════════
+
+describe("command lifecycle hooks", () => {
+  beforeEach(() => { vi.resetModules(); });
+
+  test("command:reset hook is registered", async () => {
+    const { default: plugin } = await import("../src/openclaw-plugin.js");
+    const { api, hooks } = createMockApi();
+
+    plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+    const hook = hooks.find(h => h.hookName === "command:reset");
+    assert.ok(hook, "command:reset hook must be registered");
+  });
+
+  test("command:stop hook is registered", async () => {
+    const { default: plugin } = await import("../src/openclaw-plugin.js");
+    const { api, hooks } = createMockApi();
+
+    plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+    const hook = hooks.find(h => h.hookName === "command:stop");
+    assert.ok(hook, "command:stop hook must be registered");
+  });
+
+  test("command:reset handler runs cleanupOldSessions without throwing", async () => {
+    const { default: plugin } = await import("../src/openclaw-plugin.js");
+    const { api, hooks } = createMockApi();
+
+    plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+    const hook = hooks.find(h => h.hookName === "command:reset");
+    assert.ok(hook);
+    await assert.doesNotReject(() => Promise.resolve(hook.handler()));
+  });
+});

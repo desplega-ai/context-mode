@@ -5,8 +5,8 @@
  * declarative metadata and config validation before code execution.
  *
  * register(api) registers:
- *   - tool_call:before hook   — Routing enforcement (deny/modify/passthrough)
- *   - tool_call:after hook    — Session event capture
+ *   - before_tool_call hook   — Routing enforcement (deny/modify/passthrough)
+ *   - after_tool_call hook    — Session event capture
  *   - command:new hook         — Session initialization and cleanup
  *   - session_start hook             — Re-key DB session to OpenClaw's session ID
  *   - before_compaction hook         — Flush events to resume snapshot
@@ -36,7 +36,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { SessionDB } from "./session/db.js";
-import { extractEvents } from "./session/extract.js";
+import { extractEvents, extractUserEvents } from "./session/extract.js";
 import type { HookInput } from "./session/extract.js";
 import { buildResumeSnapshot } from "./session/snapshot.js";
 import type { SessionEvent } from "./types.js";
@@ -107,12 +107,32 @@ interface SessionStartEvent {
   startedAt?: string;
 }
 
-/** Shape of the event object OpenClaw passes to tool_call hooks. */
-interface ToolCallEvent {
+/** Shape of the event object OpenClaw passes to before_tool_call hooks. */
+interface BeforeToolCallEvent {
   toolName?: string;
   params?: Record<string, unknown>;
+  runId?: string;
+  toolCallId?: string;
+}
+
+/** Shape of the event OpenClaw passes to before_model_resolve hooks. */
+interface BeforeModelResolveEvent {
+  userMessage?: string;
+  message?: string;
+  content?: string;
+}
+
+/** Shape of the event object OpenClaw passes to tool_call:after hooks. */
+interface AfterToolCallEvent {
+  toolName?: string;
+  params?: Record<string, unknown>;
+  /** Result payload — OpenClaw v2+ uses `result`; older builds use `output`. */
+  result?: unknown;
   output?: string;
+  /** Error indicator — string message (v2+) or boolean flag (older builds). */
+  error?: string;
   isError?: boolean;
+  durationMs?: number;
 }
 
 /** Plugin config schema for OpenClaw validation. */
@@ -214,7 +234,7 @@ export default {
       "tool_call:before",
       async (event: unknown) => {
         const { routing } = await initPromise;
-        const e = event as ToolCallEvent;
+        const e = event as BeforeToolCallEvent;
         const toolName = e.toolName ?? "";
         const toolInput = e.params ?? {};
 
@@ -235,8 +255,7 @@ export default {
         }
 
         if (decision.action === "modify" && decision.updatedInput) {
-          // In-place mutation is required by OpenClaw's hook paradigm —
-          // the gateway reads the mutated params object after the hook returns.
+          // In-place mutation — OpenClaw reads the mutated params object.
           Object.assign(toolInput, decision.updatedInput);
         }
 
@@ -251,21 +270,71 @@ export default {
 
     // ── 2. tool_call:after — Session event capture ─────────
 
+    // Map OpenClaw tool names → Claude Code equivalents so extractEvents
+    // can recognize them. OpenClaw uses lowercase names; CC uses PascalCase.
+    const OPENCLAW_TOOL_MAP: Record<string, string> = {
+      exec: "Bash",
+      read: "Read",
+      write: "Write",
+      edit: "Edit",
+      apply_patch: "Edit",
+      glob: "Glob",
+      grep: "Grep",
+      search: "Grep",
+    };
+
     api.registerHook(
       "tool_call:after",
       async (event: unknown) => {
         try {
-          const e = event as ToolCallEvent;
+          const e = event as AfterToolCallEvent;
+          const rawToolName = e.toolName ?? "";
+          const mappedToolName = OPENCLAW_TOOL_MAP[rawToolName] ?? rawToolName;
+          // Accept both result (v2+) and output (older builds)
+          const rawResult = e.result ?? e.output;
+          const resultStr =
+            typeof rawResult === "string"
+              ? rawResult
+              : rawResult != null
+                ? JSON.stringify(rawResult)
+                : undefined;
+          // Accept both error (string, v2+) and isError (boolean, older builds)
+          const hasError = Boolean(e.error || e.isError);
+
           const hookInput: HookInput = {
-            tool_name: e.toolName ?? "",
+            tool_name: mappedToolName,
             tool_input: e.params ?? {},
-            tool_response: e.output,
-            tool_output: e.isError ? { isError: true } : undefined,
+            tool_response: resultStr,
+            tool_output: hasError ? { isError: true } : undefined,
           };
 
           const events = extractEvents(hookInput);
-          for (const ev of events) {
-            db.insertEvent(sessionId, ev as SessionEvent, "PostToolUse");
+
+          if (events.length > 0) {
+            for (const ev of events) {
+              db.insertEvent(sessionId, ev as SessionEvent, "PostToolUse");
+            }
+          } else if (rawToolName) {
+            // Fallback: record any unrecognized tool call as a generic event
+            const data = JSON.stringify({
+              tool: rawToolName,
+              params: e.params,
+              durationMs: e.durationMs,
+            });
+            db.insertEvent(
+              sessionId,
+              {
+                type: "tool_call",
+                category: "openclaw",
+                data,
+                priority: 1,
+                data_hash: createHash("sha256")
+                  .update(data)
+                  .digest("hex")
+                  .slice(0, 16),
+              },
+              "PostToolUse",
+            );
           }
         } catch {
           // Silent — session capture must never break the tool call
@@ -293,6 +362,38 @@ export default {
         name: "context-mode.session-new",
         description:
           "Session initialization — cleans up old sessions on /new command",
+      },
+    );
+
+    // ── 3b. command:reset / command:stop — Session cleanup ────
+
+    api.registerHook(
+      "command:reset",
+      async () => {
+        try {
+          db.cleanupOldSessions(0);
+        } catch {
+          // best effort
+        }
+      },
+      {
+        name: "context-mode.session-reset",
+        description: "Session cleanup on /reset command",
+      },
+    );
+
+    api.registerHook(
+      "command:stop",
+      async () => {
+        try {
+          db.cleanupOldSessions(0);
+        } catch {
+          // best effort
+        }
+      },
+      {
+        name: "context-mode.session-stop",
+        description: "Session cleanup on /stop command",
       },
     );
 
@@ -347,7 +448,26 @@ export default {
       },
     );
 
-    // ── 7. before_prompt_build — Resume snapshot injection ────
+    // ── 7. before_model_resolve — User message capture ────────
+
+    api.on(
+      "before_model_resolve",
+      async (event: unknown) => {
+        try {
+          const e = event as BeforeModelResolveEvent;
+          const text = e?.userMessage ?? e?.message ?? e?.content ?? "";
+          if (!text) return;
+          const events = extractUserEvents(text);
+          for (const ev of events) {
+            db.insertEvent(sessionId, ev as import("./types.js").SessionEvent, "PostToolUse");
+          }
+        } catch {
+          // best effort — never break model resolution
+        }
+      },
+    );
+
+    // ── 8. before_prompt_build — Resume snapshot injection ────
 
     api.on(
       "before_prompt_build",

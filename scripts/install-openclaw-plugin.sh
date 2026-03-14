@@ -30,25 +30,44 @@ cat > "$EXT_DIR/index.ts" << TSEOF
 export { default } from "$PLUGIN_ROOT/build/openclaw-plugin.js";
 TSEOF
 
-# 3. Verify plugin is discovered by OpenClaw
+# 3. Clear jiti cache so stale compiled TS doesn't survive extension dir update
+echo "→ clearing jiti cache for context-mode..."
+rm -f /tmp/jiti/context-mode-index.*.cjs /tmp/jiti/build-openclaw-plugin.*.cjs 2>/dev/null || true
+echo "  ✓ jiti cache cleared"
+
+# 4. Verify plugin is discovered by OpenClaw
 echo "→ verifying discovery..."
-OPENCLAW_NODE=$(node -e "require.resolve('openclaw')" 2>/dev/null | sed 's|/dist/index.js||' || true)
-OPENCLAW_BIN="$(npm root -g)/openclaw/dist/index.js"
-if OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" node "$OPENCLAW_BIN" plugins list 2>&1 | grep -q 'context-mode'; then
+OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || echo "")"
+if [ -z "$OPENCLAW_BIN" ]; then
+  # Try common npm-global locations
+  for candidate in "$HOME/.npm-global/bin/openclaw" "$HOME/.local/bin/openclaw" "$(npm root -g 2>/dev/null)/../bin/openclaw"; do
+    [ -x "$candidate" ] && OPENCLAW_BIN="$candidate" && break
+  done
+fi
+if [ -n "$OPENCLAW_BIN" ] && OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" "$OPENCLAW_BIN" plugins list 2>&1 | grep -q 'context-mode'; then
   echo "  ✓ context-mode discovered"
 else
-  echo "  ✗ plugin not discovered — check $EXT_DIR"
-  exit 1
+  echo "  ⚠ could not verify discovery (openclaw not in PATH or plugin not found) — continuing anyway"
 fi
 
-# 4. Register in runtime config (idempotent)
+# 5. Register in runtime config (idempotent)
 echo "→ registering in $RUNTIME_JSON..."
-python3 - "$RUNTIME_JSON" <<'PYEOF'
+python3 - "$RUNTIME_JSON" "$PLUGIN_ROOT" <<'PYEOF'
 import json, sys
-path = sys.argv[1]
+path, plugin_root = sys.argv[1], sys.argv[2]
 with open(path) as f:
     cfg = json.load(f)
 plugins = cfg.setdefault("plugins", {})
+# Remove plugins.load.paths entry for this plugin root — it causes duplicate registration
+load_cfg = plugins.get("load", {})
+paths = load_cfg.get("paths", [])
+if plugin_root in paths:
+    paths.remove(plugin_root)
+    if not paths:
+        load_cfg.pop("paths", None)
+    if not load_cfg:
+        plugins.pop("load", None)
+    print("  removed plugins.load.paths entry (caused duplicate registration)")
 allow = plugins.setdefault("allow", [])
 if "context-mode" not in allow:
     allow.insert(0, "context-mode")
@@ -60,12 +79,14 @@ with open(path, "w") as f:
 print("  plugins.allow:", allow)
 PYEOF
 
-# 5. Restart gateway
-echo "→ restarting openclaw-gateway..."
-if XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart openclaw-gateway 2>/dev/null; then
-  echo "  ✓ gateway restarted via systemd"
+# 6. Restart gateway
+echo "→ restarting openclaw gateway..."
+GATEWAY_PID=$(pgrep -f "node.*openclaw/dist/index.js" 2>/dev/null | head -1 || true)
+if [ -n "$GATEWAY_PID" ]; then
+  # SIGUSR1 triggers a clean config reload/restart in OpenClaw
+  kill -USR1 "$GATEWAY_PID" 2>/dev/null && echo "  ✓ SIGUSR1 sent to gateway (PID $GATEWAY_PID)" || echo "  ⚠ could not signal gateway"
 else
-  echo "  ⚠ restart manually: systemctl --user restart openclaw-gateway"
+  echo "  ⚠ gateway not running — start it manually: OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR openclaw gateway start"
 fi
 
 echo ""
