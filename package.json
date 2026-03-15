@@ -70,8 +70,7 @@
     "benchmark": "npx tsx tests/benchmark.ts",
     "test:use-cases": "npx tsx tests/use-cases.ts",
     "test:compare": "npx tsx tests/context-comparison.ts",
-    "test:ecosystem": "npx tsx tests/ecosystem-benchmark.ts",
-    "deploy": "npm run build && node scripts/deploy-openclaw.mjs"
+    "test:ecosystem": "npx tsx tests/ecosystem-benchmark.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.0.1",

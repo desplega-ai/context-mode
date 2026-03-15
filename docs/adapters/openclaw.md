@@ -76,7 +76,15 @@ Both issues below have been resolved in upstream OpenClaw:
 - **[#4967](https://github.com/openclaw/openclaw/issues/4967)** — Compaction hooks not firing. Closed as duplicate of [#3728](https://github.com/openclaw/openclaw/issues/3728); fix merged.
 - **[#5513](https://github.com/openclaw/openclaw/issues/5513)** — `api.on()` hooks not invoked for tool lifecycle events. Fixed in [PR #9761](https://github.com/openclaw/openclaw/pull/9761).
 
-**Minimum recommended OpenClaw version: >2026.1.29** (includes both fixes).
+## Minimum Version
+
+**Required: OpenClaw >2026.1.29**
+
+This is the first release that includes the `api.on()` fix from [PR #9761](https://github.com/openclaw/openclaw/pull/9761), which shipped on 2026-01-29.
+
+**What breaks on older versions:** Lifecycle hooks registered via `api.on()` — including `before_compaction`, `after_compaction`, `session_start`, and tool interception hooks — may silently fail to fire.
+
+**Graceful degradation:** If compaction hooks don't fire, the adapter falls back to DB snapshot reconstruction, rebuilding session state from events already persisted by `after_tool_call`. This produces a less precise snapshot than the PreCompact path but preserves critical state (active files, tasks, errors). The adapter will not crash on older versions, but compaction recovery quality will be reduced.
 
 ## Workspace Routing
 

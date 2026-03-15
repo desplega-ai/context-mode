@@ -36,6 +36,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { SessionDB } from "./session/db.js";
+import { OpenClawSessionDB } from "./adapters/openclaw/session-db.js";
 import { extractEvents, extractUserEvents } from "./session/extract.js";
 import type { HookInput } from "./session/extract.js";
 import { buildResumeSnapshot } from "./session/snapshot.js";
@@ -180,11 +181,12 @@ function getDBPath(projectDir: string): string {
 // ── Module-level DB singleton ─────────────────────────────
 // Shared across all register() calls (one per agent session).
 // Lazy-initialized on first register() using the first projectDir seen.
-let _dbSingleton: SessionDB | null = null;
-function getOrCreateDB(projectDir: string): SessionDB {
+// Uses OpenClawSessionDB for session_key mapping and rename support.
+let _dbSingleton: OpenClawSessionDB | null = null;
+function getOrCreateDB(projectDir: string): OpenClawSessionDB {
   if (!_dbSingleton) {
     const dbPath = getDBPath(projectDir);
-    _dbSingleton = new SessionDB({ dbPath });
+    _dbSingleton = new OpenClawSessionDB({ dbPath });
     _dbSingleton.cleanupOldSessions(7);
   }
   return _dbSingleton;
@@ -193,7 +195,7 @@ function getOrCreateDB(projectDir: string): SessionDB {
 // ── Module-level state for command handlers ───────────────
 // Commands are re-registered on each register() call (OpenClaw's registerCommand
 // is idempotent). These refs give handlers access to the current session's state.
-let _latestDb: SessionDB | null = null;
+let _latestDb: OpenClawSessionDB | null = null;
 let _latestSessionId = "";
 let _latestPluginRoot = "";
 
@@ -468,7 +470,7 @@ export default {
               db.renameSession(prevId, sid);
               log.info(`session re-keyed ${prevId.slice(0, 8)}… → ${sid.slice(0, 8)}… (key=${key})`);
             } else if (!prevId) {
-              db.ensureSession(sid, projectDir, key);
+              db.ensureSessionWithKey(sid, projectDir, key);
               log.info(`new session ${sid.slice(0, 8)}… (key=${key})`);
             }
           } else {

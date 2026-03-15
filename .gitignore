@@ -7,6 +7,8 @@ packages/*/dist/
 *.db
 server.bundle.mjs
 cli.bundle.mjs
+stats.json
+package-lock.json
 gh-cli-cache/
 tasks/
 .playwright-mcp/

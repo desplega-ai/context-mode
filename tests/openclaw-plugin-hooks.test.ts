@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeEach, describe, test, vi } from "vitest";
 import { SessionDB } from "../src/session/db.js";
+import { OpenClawSessionDB } from "../src/adapters/openclaw/session-db.js";
 
 // ── Helpers ──────────────────────────────────────────────
 
@@ -18,6 +19,13 @@ afterAll(() => {
 function createTestDB(): SessionDB {
   const dbPath = join(tmpdir(), `plugin-hooks-test-${randomUUID()}.db`);
   const db = new SessionDB({ dbPath });
+  cleanups.push(() => db.cleanup());
+  return db;
+}
+
+function createOpenClawTestDB(): OpenClawSessionDB {
+  const dbPath = join(tmpdir(), `plugin-hooks-test-oc-${randomUUID()}.db`);
+  const db = new OpenClawSessionDB({ dbPath });
   cleanups.push(() => db.cleanup());
   return db;
 }
@@ -255,52 +263,51 @@ describe("resume injection (before_prompt_build)", () => {
 // SessionDB.getMostRecentSession
 // ════════════════════════════════════════════
 
-describe("SessionDB.getMostRecentSession", () => {
+describe("OpenClawSessionDB.getMostRecentSession", () => {
   test("returns null when no sessions exist for sessionKey", () => {
-    const db = createTestDB();
+    const db = createOpenClawTestDB();
     const result = db.getMostRecentSession("no-such-key");
     assert.equal(result, null);
   });
 
   test("returns session_id scoped by sessionKey", () => {
-    const db = createTestDB();
+    const db = createOpenClawTestDB();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
     const keyA = "agent-a:telegram:111";
     const keyB = "agent-b:telegram:222";
     const sidA = randomUUID();
     const sidB = randomUUID();
 
-    db.ensureSession(sidA, projectDir, keyA);
-    db.ensureSession(sidB, projectDir, keyB);
+    db.ensureSessionWithKey(sidA, projectDir, keyA);
+    db.ensureSessionWithKey(sidB, projectDir, keyB);
 
     assert.equal(db.getMostRecentSession(keyA), sidA);
     assert.equal(db.getMostRecentSession(keyB), sidB);
   });
 
-  test("returns most recent session when multiple exist for same sessionKey", () => {
-    const db = createTestDB();
+  test("returns most recent session when multiple exist for same sessionKey (upsert overwrites)", () => {
+    const db = createOpenClawTestDB();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
     const key = "agent-a:telegram:111";
     const sid1 = randomUUID();
     const sid2 = randomUUID();
 
-    db.ensureSession(sid1, projectDir, key);
-    db.ensureSession(sid2, projectDir, key);
+    db.ensureSessionWithKey(sid1, projectDir, key);
+    db.ensureSessionWithKey(sid2, projectDir, key);
 
     const result = db.getMostRecentSession(key);
-    // Both have sub-second timestamps from DEFAULT (datetime('now')),
-    // but sid2 was inserted last so ORDER BY started_at DESC, rowid DESC returns sid2
-    assert.equal(result, sid2, "must return the most recently inserted session");
+    // openclaw_session_map uses UPSERT — second call overwrites the mapping
+    assert.equal(result, sid2, "must return the most recently mapped session");
   });
 
   test("ignores sessions with different sessionKey", () => {
-    const db = createTestDB();
+    const db = createOpenClawTestDB();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
     const sidA = randomUUID();
     const sidB = randomUUID();
 
-    db.ensureSession(sidA, projectDir, "agent-a:telegram:111");
-    db.ensureSession(sidB, projectDir, "agent-b:telegram:222");
+    db.ensureSessionWithKey(sidA, projectDir, "agent-a:telegram:111");
+    db.ensureSessionWithKey(sidB, projectDir, "agent-b:telegram:222");
 
     assert.equal(db.getMostRecentSession("agent-a:telegram:111"), sidA);
   });
@@ -310,22 +317,22 @@ describe("SessionDB.getMostRecentSession", () => {
 // SessionDB.session_key support
 // ════════════════════════════════════════════
 
-describe("SessionDB.session_key support", () => {
-  test("ensureSession accepts optional sessionKey parameter", () => {
-    const db = createTestDB();
+describe("OpenClawSessionDB.session_key support", () => {
+  test("ensureSessionWithKey stores session_key in openclaw_session_map", () => {
+    const db = createOpenClawTestDB();
     const sid = randomUUID();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
     const sessionKey = "agent-a:telegram:12345";
 
-    db.ensureSession(sid, projectDir, sessionKey);
+    db.ensureSessionWithKey(sid, projectDir, sessionKey);
 
     const stats = db.getSessionStats(sid);
     assert.ok(stats, "session must exist");
-    assert.equal(stats.session_key, sessionKey, "session_key must be stored");
+    assert.equal(db.getMostRecentSession(sessionKey), sid, "session_key must be mapped");
   });
 
-  test("ensureSession works without sessionKey (backward compat)", () => {
-    const db = createTestDB();
+  test("ensureSession works without sessionKey (backward compat via base class)", () => {
+    const db = createOpenClawTestDB();
     const sid = randomUUID();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
 
@@ -333,7 +340,6 @@ describe("SessionDB.session_key support", () => {
 
     const stats = db.getSessionStats(sid);
     assert.ok(stats, "session must exist");
-    assert.equal(stats.session_key, null, "session_key defaults to null");
   });
 });
 
@@ -341,9 +347,9 @@ describe("SessionDB.session_key support", () => {
 // SessionDB.renameSession
 // ════════════════════════════════════════════
 
-describe("SessionDB.renameSession", () => {
+describe("OpenClawSessionDB.renameSession", () => {
   test("migrates events to new session ID", () => {
-    const db = createTestDB();
+    const db = createOpenClawTestDB();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
     const oldId = randomUUID();
     const newId = randomUUID();
@@ -360,7 +366,7 @@ describe("SessionDB.renameSession", () => {
   });
 
   test("migrates session meta to new session ID", () => {
-    const db = createTestDB();
+    const db = createOpenClawTestDB();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
     const oldId = randomUUID();
     const newId = randomUUID();
@@ -373,7 +379,7 @@ describe("SessionDB.renameSession", () => {
   });
 
   test("migrates resume snapshot to new session ID", () => {
-    const db = createTestDB();
+    const db = createOpenClawTestDB();
     const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
     const oldId = randomUUID();
     const newId = randomUUID();
@@ -387,7 +393,7 @@ describe("SessionDB.renameSession", () => {
   });
 
   test("is a no-op if oldId does not exist", () => {
-    const db = createTestDB();
+    const db = createOpenClawTestDB();
     assert.doesNotThrow(() => db.renameSession(randomUUID(), randomUUID()));
   });
 });
