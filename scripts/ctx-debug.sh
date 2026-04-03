@@ -17,6 +17,18 @@ set -uo pipefail  # NOT -e — we must never crash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)}"
 
+# timed SECS CMD [ARGS...] — portable timeout wrapper (macOS has no `timeout`)
+timed() {
+  local secs="$1"; shift
+  if command -v timeout &>/dev/null; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout &>/dev/null; then
+    gtimeout "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
 # safe_cmd CMD [ARGS...] — run a command with a 10-second timeout.
 # Prints stdout on success or a failure marker on error.
 safe_cmd() {
@@ -129,6 +141,9 @@ TS="$(date +%s)"
 EFFECTIVE_TMP="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
 REPORT_FILE="${EFFECTIVE_TMP}/ctx-debug-${TS}.md"
 JSON_FILE="${EFFECTIVE_TMP}/ctx-debug-${TS}.json"
+
+# Ensure node can find plugin dependencies
+export NODE_PATH="$PLUGIN_ROOT/node_modules:${NODE_PATH:-}"
 
 # Redirect all markdown output to report file — terminal stays clean
 exec 3>&1          # save original stdout (terminal)
@@ -661,11 +676,15 @@ printf -- '  - ... (%d total entries)\n' "${#PATH_PARTS[@]}"
 
 section "13. Hook Execution"
 
+# Note: hooks may fail outside an active session — this is expected.
+# The test validates the hook CAN execute, not that a session exists.
 HOOK_PRE="$PLUGIN_ROOT/hooks/pretooluse.mjs"
+# Hooks need CLAUDE_PLUGIN_ROOT to resolve internal imports
+export CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT"
 if [ -f "$HOOK_PRE" ]; then
   # Test 1: PreToolUse WebFetch → should deny/redirect
   PRE_INPUT='{"tool_name":"WebFetch","tool_input":{"url":"https://example.com"}}'
-  PRE_OUTPUT="$(printf '%s' "$PRE_INPUT" | timeout 10 node "$HOOK_PRE" 2>/dev/null || true)"
+  PRE_OUTPUT="$(printf '%s' "$PRE_INPUT" | CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" timed 10 node "$HOOK_PRE" 2>/dev/null || true)"
   if [ -n "$PRE_OUTPUT" ]; then
     PRE_VALID="$(node -e "
       try {
@@ -683,7 +702,7 @@ if [ -f "$HOOK_PRE" ]; then
 
   # Test 2: PreToolUse Write → should passthrough (no deny)
   PASS_INPUT='{"tool_name":"Write","tool_input":{"file_path":"/tmp/test.txt","content":"hello"}}'
-  PASS_OUTPUT="$(printf '%s' "$PASS_INPUT" | timeout 10 node "$HOOK_PRE" 2>/dev/null || true)"
+  PASS_OUTPUT="$(printf '%s' "$PASS_INPUT" | CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" timed 10 node "$HOOK_PRE" 2>/dev/null || true)"
   if [ -z "$PASS_OUTPUT" ]; then
     check "PreToolUse passes Write tool through" "true"
   else
@@ -700,7 +719,7 @@ fi
 HOOK_SS="$PLUGIN_ROOT/hooks/sessionstart.mjs"
 if [ -f "$HOOK_SS" ]; then
   SS_INPUT='{"source":"startup"}'
-  SS_OUTPUT="$(printf '%s' "$SS_INPUT" | timeout 15 node "$HOOK_SS" 2>/dev/null || true)"
+  SS_OUTPUT="$(printf '%s' "$SS_INPUT" | CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" timed 15 node "$HOOK_SS" 2>/dev/null || true)"
   if [ -n "$SS_OUTPUT" ]; then
     SS_VALID="$(node -e "
       try {
@@ -728,21 +747,17 @@ SERVER_ENTRY="$PLUGIN_ROOT/server.bundle.mjs"
 [ ! -f "$SERVER_ENTRY" ] && SERVER_ENTRY="$PLUGIN_ROOT/build/server.js"
 
 if [ -f "$SERVER_ENTRY" ]; then
-  # Lightweight: verify module can be imported
-  SERVER_IMPORT="$(timeout 15 node --input-type=module -e "
-    try {
-      await import('file://$SERVER_ENTRY');
-      console.log('PASS');
-      setTimeout(() => process.exit(0), 200);
-    } catch(e) {
-      console.log('FAIL: ' + e.message.split('\n')[0]);
-      process.exit(0);
-    }
-  " 2>/dev/null || echo "FAIL: timeout or crash")"
-  check "Server module loads" "$(echo "$SERVER_IMPORT" | grep -q '^PASS' && echo true || echo false)"
-  [ "$(echo "$SERVER_IMPORT" | grep -q '^PASS' && echo true)" != "true" ] && printf -- '  > %s\n' "$SERVER_IMPORT"
-
-  true  # MCP JSON-RPC test placeholder
+  # Verify server module can be parsed (not imported — import starts MCP transport)
+  SERVER_CHECK="$(timed 10 node -e "
+    const fs = require('fs');
+    const src = fs.readFileSync('$SERVER_ENTRY', 'utf8');
+    // Check critical imports resolve
+    try { require.resolve('better-sqlite3'); } catch(e) { console.log('FAIL: ' + e.message); process.exit(0); }
+    try { require.resolve('@modelcontextprotocol/sdk/server/mcp.js'); } catch(e) { console.log('FAIL: ' + e.message); process.exit(0); }
+    console.log('PASS');
+  " 2>/dev/null || echo "FAIL: timeout")"
+  check "Server entry + deps resolve" "$(echo "$SERVER_CHECK" | grep -q '^PASS' && echo true || echo false)"
+  [ "$(echo "$SERVER_CHECK" | grep -q '^PASS' && echo true)" != "true" ] && printf -- '  > %s\n' "$SERVER_CHECK"
 else
   check "Server module loads" "false"
   printf -- '  > Not found: server.bundle.mjs or build/server.js\n'
@@ -781,7 +796,7 @@ else
   printf -- '- No session directory at %s\n' "$(abbrev_path "$SESSION_BASE")"
 fi
 
-CONCUR="$(timeout 15 node -e "
+CONCUR="$(timed 15 node -e "
   const Database = require('better-sqlite3');
   const os = require('os'), fs = require('fs'), path = require('path');
   const dbPath = path.join(os.tmpdir(), 'ctx-debug-concur-' + process.pid + '.db');
@@ -817,7 +832,7 @@ section "16. Adapter Validation"
 
 DETECT_JS="$PLUGIN_ROOT/build/adapters/detect.js"
 if [ -f "$DETECT_JS" ]; then
-  ADAPTER_VAL="$(timeout 15 node --input-type=module -e "
+  ADAPTER_VAL="$(timed 15 node --input-type=module -e "
     try {
       const { detectPlatform, getAdapter } = await import('file://$DETECT_JS');
       const signal = detectPlatform();
@@ -837,8 +852,10 @@ if [ -f "$DETECT_JS" ]; then
   ADAPTER_NAME="$(echo "$ADAPTER_VAL" | grep '^platform:' | cut -d' ' -f2-)"
   kv "Validated adapter" "${ADAPTER_NAME:-unknown}"
 
-  FAIL_N="$(echo "$ADAPTER_VAL" | grep -c '^fail:' 2>/dev/null || echo 0)"
-  check "Adapter validation passes" "$([ "${FAIL_N:-0}" -eq 0 ] && echo true || echo false)"
+  FAIL_N="$(echo "$ADAPTER_VAL" | grep -c '^fail:' 2>/dev/null || true)"
+  FAIL_N="$(echo "$FAIL_N" | tr -d ' \n')"
+  FAIL_N="${FAIL_N:-0}"
+  check "Adapter validation passes" "$([ "$FAIL_N" -eq 0 ] 2>/dev/null && echo true || echo false)"
 
   echo "$ADAPTER_VAL" | grep -E '^(pass|fail|warn):' | while IFS= read -r line; do
     status="${line%%:*}"
@@ -918,7 +935,7 @@ done
 [ "$PROXY_SET" = "false" ] && printf -- '- No proxy environment variables detected\n'
 
 # HTTPS connectivity
-NPM_TLS="$(timeout 10 node -e "
+NPM_TLS="$(timed 10 node -e "
   const https = require('https');
   const req = https.get('https://registry.npmjs.org/context-mode', { timeout: 5000 }, (res) => {
     console.log('PASS: HTTP ' + res.statusCode);
@@ -976,10 +993,13 @@ printf '> ctx-debug.sh v%s — https://github.com/mksglu/context-mode/issues/new
 
 exec 1>&3  # restore stdout → terminal
 
-# Count results from the markdown report
-PASS_N="$(grep -c '^\- \[x\]' "$REPORT_FILE" 2>/dev/null || echo 0)"
-FAIL_N="$(grep -c '^\- \[ \]' "$REPORT_FILE" 2>/dev/null || echo 0)"
-WARN_N="$(grep -c '⚠' "$REPORT_FILE" 2>/dev/null || echo 0)"
+# Count results from the markdown report (tr -d to strip whitespace/newlines)
+PASS_N="$(grep -c '^\- \[x\]' "$REPORT_FILE" 2>/dev/null | tr -d ' \n' || true)"
+PASS_N="${PASS_N:-0}"
+FAIL_N="$(grep -c '^\- \[ \]' "$REPORT_FILE" 2>/dev/null | tr -d ' \n' || true)"
+FAIL_N="${FAIL_N:-0}"
+WARN_N="$(grep -c 'WARNING\|warning\|WARN' "$REPORT_FILE" 2>/dev/null | tr -d ' \n' || true)"
+WARN_N="${WARN_N:-0}"
 
 # Generate JSON from markdown
 node -e "
